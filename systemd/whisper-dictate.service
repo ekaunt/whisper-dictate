@@ -1,0 +1,13 @@
+[Unit]
+Description=Local Whisper dictation daemon
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/share/whisper-dictate/.venv/bin/python %h/.local/share/whisper-dictate/daemon.py
+Restart=on-failure
+RestartSec=3
+Environment=HF_HOME=%h/.cache/huggingface
+Environment=LD_LIBRARY_PATH=%h/.local/share/whisper-dictate/.venv/lib/python3.12/site-packages/nvidia/cublas/lib:%h/.local/share/whisper-dictate/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib
+
+[Install]
+WantedBy=default.target

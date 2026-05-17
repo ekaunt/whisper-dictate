@@ -1,0 +1,5 @@
+# Push-to-talk voice dictation. The `@` prefix means "fire on key release".
+super + z
+	~/.local/bin/dictate start
+@super + z
+	~/.local/bin/dictate stop

@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Push-to-talk voice dictation with live streaming transcription.
+#   dictate start   # spawn parec, write pidfile, show recording notification
+#   dictate stop    # SIGTERM parec, stream partial transcripts from daemon;
+#                   # each chunk is xdotool-typed into focused window and
+#                   # shown in the notification as it arrives
+set -euo pipefail
+
+PIDFILE="${XDG_RUNTIME_DIR:?}/dictate.pid"
+SOCK="${XDG_RUNTIME_DIR:?}/whisper-dictate.sock"
+SYNC_HINT='string:x-canonical-private-synchronous:dictate'
+
+notify() {
+    # $1=timeout_ms, rest=notify-send args
+    local t=$1; shift
+    notify-send -t "$t" -h "$SYNC_HINT" "$@"
+}
+
+case "${1:-}" in
+    start)
+        # If already recording (e.g. key auto-repeat), do nothing.
+        if [[ -f "$PIDFILE" ]] && kill -0 "$(cut -d: -f1 < "$PIDFILE")" 2>/dev/null; then
+            exit 0
+        fi
+        # Refuse to record if the daemon isn't reachable — otherwise the user
+        # speaks into a void and finds out only when stop hangs.
+        if ! printf '{"cmd":"ping"}\n' | nc -U -w 1 -W 1 "$SOCK" 2>/dev/null | jq -e '.ok' >/dev/null 2>&1; then
+            notify 3000 "Dictation daemon not ready"
+            exit 1
+        fi
+        wav=$(mktemp /tmp/dictate-XXXXXX.wav)
+        # --latency-msec=20: ask the server for ~20ms capture buffer so the
+        # tail of speech isn't stuck in flight when the user releases the key.
+        parec --device=@DEFAULT_SOURCE@ --latency-msec=20 \
+              --format=s16le --rate=16000 --channels=1 \
+              --file-format=wav "$wav" >/dev/null 2>&1 &
+        echo "$!:$wav" > "$PIDFILE"
+        # Long timeout: stays visible while user is speaking, replaced on stop.
+        notify 60000 "🎤 Recording..."
+        ;;
+    stop)
+        [[ -f "$PIDFILE" ]] || exit 0
+        IFS=: read -r pid wav < "$PIDFILE"
+        rm -f "$PIDFILE"
+
+        if kill -0 "$pid" 2>/dev/null; then
+            # Give the mic pipeline a moment to deliver the trailing word
+            # the user just finished saying before we tear parec down.
+            sleep 0.3
+            kill -TERM "$pid"
+            for _ in {1..50}; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.05
+            done
+        fi
+
+        notify 60000 "✍️ Transcribing..."
+
+        accumulated=""
+        error=""
+        done_flag=""
+        ms=""
+        # Process substitution keeps variables in the parent shell.
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            err=$(jq -r '.error // empty' <<<"$line")
+            if [[ -n "$err" ]]; then error="$err"; break; fi
+
+            partial=$(jq -r '.partial // empty' <<<"$line")
+            if [[ -n "$partial" ]]; then
+                xdotool type --clearmodifiers --delay 1 -- "$partial"
+                accumulated+="$partial"
+                # Tail of accumulated text so long dictations stay readable.
+                notify 60000 "✍️ ${accumulated: -100}"
+                continue
+            fi
+
+            if [[ $(jq -r '.done // empty' <<<"$line") == "true" ]]; then
+                done_flag=1
+                ms=$(jq -r '.ms' <<<"$line")
+            fi
+        done < <(printf '{"cmd":"transcribe","wav":"%s"}\n' "$wav" | nc -U -w 30 "$SOCK")
+        rm -f "$wav"
+
+        if [[ -n "$error" ]]; then
+            notify 4000 "Dictation error" "$error"
+            exit 1
+        fi
+        if [[ -z "$accumulated" ]]; then
+            notify 2000 "Nothing transcribed"
+            exit 0
+        fi
+        notify 2500 "✓ ${ms}ms — ${accumulated: -60}"
+        ;;
+    *)
+        echo "usage: $0 {start|stop}" >&2
+        exit 2
+        ;;
+esac
